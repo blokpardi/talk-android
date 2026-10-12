@@ -439,7 +439,10 @@ class AccountVerificationActivity : BaseActivity() {
             }
             val intent = Intent(context, ConversationsListActivity::class.java)
             intent.putExtra(BundleKeys.KEY_INTERNAL_USER_ID, userToSetAsActive.id)
-            intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            // Start the list as the root of a fresh task: otherwise the login activities (and, when adding an
+            // account, a chat of the previous account) stay underneath and the split view next to the list shows
+            // stale content instead of the "select a conversation" placeholder until another chat is opened.
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
             startActivity(intent)
         } else {
             logger.e(TAG, "failed to set active user")
