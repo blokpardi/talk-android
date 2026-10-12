@@ -99,6 +99,7 @@ public class WebSocketConnectionHelper {
         if ((webSocketInstance = webSocketInstanceMap.get(id)) != null) {
             if (webSocketInstance.isConnected()) {
                 webSocketInstance.sendBye();
+                webSocketInstance.shutdown();
                 webSocketInstanceMap.remove(id);
             }
         }

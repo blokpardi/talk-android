@@ -42,7 +42,9 @@ import org.greenrobot.eventbus.EventBus
 import org.greenrobot.eventbus.Subscribe
 import org.greenrobot.eventbus.ThreadMode
 import java.io.IOException
-import java.lang.Thread.sleep
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 
@@ -77,6 +79,14 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
     private var currentNormalBackendSession: String? = null
     private var currentFederation: FederationSettingsDto? = null
     private var reconnecting = false
+
+    /** Room the app asked to be in (cleared on leave); used to re-join after a reconnect with a fresh session. */
+    private var requestedRoomToken: String? = null
+    private var reconnectAttempt = 0
+    private var pendingReconnect: ScheduledFuture<*>? = null
+
+    @Volatile
+    private var isShutDown = false
     private val usersHashMap: HashMap<String?, ParticipantDto>
     private var messagesQueue: MutableList<String> = ArrayList()
     private val signalingMessageReceiver = ExternalSignalingMessageReceiver()
@@ -136,15 +146,59 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
         }
         isConnected = false
         messagesQueue = ArrayList()
-        sleep(ONE_SECOND)
-        restartWebSocket()
+        scheduleReconnect()
+    }
+
+    /**
+     * Reconnects after an exponential backoff with jitter (1s, 2s, 4s ... capped at 30s), instead of blocking the
+     * OkHttp thread and retrying every second forever. Only one reconnect is ever pending, so repeated failures or
+     * closes cannot stack up parallel sockets.
+     */
+    @Synchronized
+    private fun scheduleReconnect() {
+        if (isShutDown) {
+            Log.d(TAG, "scheduleReconnect: instance is shut down, not reconnecting")
+            return
+        }
+        if (pendingReconnect?.isDone == false) {
+            Log.d(TAG, "scheduleReconnect: reconnect already pending")
+            return
+        }
+        val delay = reconnectDelayMillis(reconnectAttempt, ThreadLocalRandom.current().nextDouble())
+        reconnectAttempt++
+        reconnecting = true
+        Log.d(TAG, "scheduleReconnect: attempt $reconnectAttempt in $delay ms")
+        pendingReconnect = reconnectExecutor.schedule({ restartWebSocket() }, delay, TimeUnit.MILLISECONDS)
+    }
+
+    /** Stops this instance for good: no further reconnects, no event bus subscription. */
+    @Synchronized
+    fun shutdown() {
+        Log.d(TAG, "shutdown")
+        isShutDown = true
+        pendingReconnect?.cancel(false)
+        pendingReconnect = null
+        isConnected = false
+        if (eventBus?.isRegistered(this) == true) {
+            eventBus?.unregister(this)
+        }
+        internalWebSocket?.close(NORMAL_CLOSURE, null)
     }
 
     fun clearResumeId() {
         resumeId = ""
     }
 
+    @Synchronized
     fun restartWebSocket() {
+        if (isShutDown) {
+            Log.d(TAG, "restartWebSocket: instance is shut down")
+            return
+        }
+        pendingReconnect?.let {
+            if (!it.isDone) it.cancel(false)
+        }
+        pendingReconnect = null
         Log.d(TAG, "restartWebSocket: $connectionUrl")
         val previousWebSocket = internalWebSocket
         isConnected = false
@@ -338,6 +392,7 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
     private fun processHelloMessage(webSocket: WebSocket, text: String) {
         isConnected = true
         reconnecting = false
+        reconnectAttempt = 0
         val oldResumeId = resumeId
         val (_, helloResponseWebSocketMessage1) = LoganSquare.parse(
             text,
@@ -362,6 +417,9 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
         }
         messagesQueue = ArrayList()
         val helloHashMap = HashMap<String, String?>()
+        val roomToRejoin = requestedRoomToken
+        val sessionToRejoin = currentNormalBackendSession
+        val federationToRejoin = currentFederation
         if (!TextUtils.isEmpty(oldResumeId)) {
             helloHashMap["oldResumeId"] = oldResumeId
         } else {
@@ -372,6 +430,14 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
             helloHashMap[Globals.ROOM_TOKEN] = currentRoomToken
         }
         eventBus!!.post(WebSocketCommunicationEvent("hello", helloHashMap))
+
+        // A fresh signaling session (resume failed) is no longer in any room. Re-join the room the app is still
+        // in with its existing Nextcloud room session, so chat relay, typing and participant updates keep working
+        // without the UI having to notice. The join is de-duplicated if the UI re-joins as well.
+        if (TextUtils.isEmpty(oldResumeId) && shouldRejoinRoom(roomToRejoin, sessionToRejoin)) {
+            Log.d(TAG, "Re-joining room $roomToRejoin after reconnect with a new signaling session")
+            joinRoomWithRoomTokenAndSession(roomToRejoin!!, sessionToRejoin, federationToRejoin)
+        }
     }
 
     private fun sendRoomJoinedEvent() {
@@ -396,7 +462,13 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
 
     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
         Log.d(TAG, "onClosed : WebSocket ${webSocket.hashCode()} $code / $reason")
+        if (webSocket !== internalWebSocket) {
+            return
+        }
         isConnected = false
+        // Closed by the signaling server (restart, idle timeout, bye): reconnect instead of waiting for the next
+        // outgoing message or network change to notice.
+        scheduleReconnect()
     }
 
     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -421,6 +493,7 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
             val message = LoganSquare.serialize(
                 webSocketConnectionHelper.getAssembledJoinOrLeaveRoomModel(roomToken, normalBackendSession, federation)
             )
+            requestedRoomToken = roomToken.ifEmpty { null }
             if (roomToken == "") {
                 Log.d(TAG, "sending 'leave room' via websocket")
                 currentNormalBackendSession = ""
@@ -543,7 +616,24 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
     companion object {
         private const val TAG = "WebSocketInstance"
         private const val NORMAL_CLOSURE = 1000
-        private const val ONE_SECOND: Long = 1000
+        private const val INITIAL_RECONNECT_DELAY_MS: Long = 1000
+        private const val MAX_RECONNECT_DELAY_MS: Long = 30000
+        private const val MAX_BACKOFF_SHIFT = 5
+        private const val JITTER_FRACTION = 0.2
+
+        private val reconnectExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "SignalingReconnect").apply { isDaemon = true }
+        }
+
+        /** Backoff delay for reconnect [attempt] (0-based), with up to +20% jitter from [random] in [0, 1). */
+        internal fun reconnectDelayMillis(attempt: Int, random: Double): Long {
+            val base = (INITIAL_RECONNECT_DELAY_MS shl attempt.coerceIn(0, MAX_BACKOFF_SHIFT))
+                .coerceAtMost(MAX_RECONNECT_DELAY_MS)
+            return base + (base * JITTER_FRACTION * random.coerceIn(0.0, 1.0)).toLong()
+        }
+
+        internal fun shouldRejoinRoom(roomToken: String?, normalBackendSession: String?): Boolean =
+            !roomToken.isNullOrEmpty() && !normalBackendSession.isNullOrEmpty() && normalBackendSession != "0"
         private const val PING_INTERVAL_SECONDS: Long = 30
 
         // Dedicated client with pings, so half-open WebSocket connections
