@@ -2101,6 +2101,12 @@ class ChatActivity :
             embeddedInstance = java.lang.ref.WeakReference(this)
         }
 
+        // The split pane can change bounds (fold/unfold, split ratio, pane added/removed) without recreating the
+        // activity; re-dispatch insets so the toolbar padding matches the current window instead of a stale one.
+        if (::binding.isInitialized) {
+            ViewCompat.requestApplyInsets(binding.chatContainer)
+        }
+
         pullChatMessagesPending = false
 
         // reset in case a previously started leave failed (success already resets this in leaveRoomObserver)

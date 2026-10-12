@@ -197,7 +197,8 @@
 
         <activity
             android:name=".chat.ChatActivity"
-            android:theme="@style/AppTheme.DisplayCutout" />
+            android:theme="@style/AppTheme.DisplayCutout"
+            android:windowSoftInputMode="adjustResize" />
 
         <activity
             android:name=".conversationlist.ChatPlaceholderActivity"
