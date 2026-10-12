@@ -155,6 +155,7 @@ import com.nextcloud.talk.viewmodels.CallRecordingViewModel.RecordingConfirmStop
 import com.nextcloud.talk.viewmodels.CallRecordingViewModel.RecordingErrorState
 import com.nextcloud.talk.viewmodels.CallRecordingViewModel.RecordingStartedState
 import com.nextcloud.talk.viewmodels.CallRecordingViewModel.RecordingStartingState
+import com.nextcloud.talk.webrtc.IceServerListBuilder
 import com.nextcloud.talk.webrtc.PeerConnectionWrapper
 import com.nextcloud.talk.webrtc.PeerConnectionWrapper.PeerConnectionObserver
 import com.nextcloud.talk.webrtc.WebRTCUtils
@@ -1670,39 +1671,23 @@ class CallActivity : CallBaseActivity() {
             })
     }
 
+    @Suppress("UNUSED_PARAMETER")
     private fun addIceServers(signalingSettingsOverall: SignalingSettingsOverall, apiVersion: Int) {
-        if (signalingSettingsOverall.ocs!!.settings!!.stunServers != null) {
-            val stunServers = signalingSettingsOverall.ocs!!.settings!!.stunServers
-            if (apiVersion == ApiUtils.API_V3) {
-                for ((_, urls) in stunServers!!) {
-                    if (urls != null) {
-                        for (url in urls) {
-                            Log.d(TAG, "   STUN server url: $url")
-                            iceServers!!.add(PeerConnection.IceServer(url))
-                        }
-                    }
-                }
-            } else {
-                if (signalingSettingsOverall.ocs!!.settings!!.stunServers != null) {
-                    for ((url) in stunServers!!) {
-                        Log.d(TAG, "   STUN server url: $url")
-                        iceServers!!.add(PeerConnection.IceServer(url))
-                    }
-                }
-            }
-        }
-
-        if (signalingSettingsOverall.ocs!!.settings!!.turnServers != null) {
-            val turnServers = signalingSettingsOverall.ocs!!.settings!!.turnServers
-            for ((_, urls, username, credential) in turnServers!!) {
-                if (urls != null) {
-                    for (url in urls) {
-                        Log.d(TAG, "   TURN server url: $url")
-                        iceServers!!.add(PeerConnection.IceServer(url, username, credential))
-                    }
-                }
-            }
-        }
+        // Built from the per-conversation settings (which, for a federated conversation, include the TURN servers of
+        // the host with their own credentials) and swapped in as a whole, so a list replaced meanwhile (e.g. by
+        // basicInitialization()) can't leave peer connections without the servers.
+        val specs = IceServerListBuilder.build(signalingSettingsOverall.ocs?.settings)
+        Log.d(
+            TAG,
+            "ICE servers for $roomToken (federated=${signalingSettingsOverall.ocs?.settings?.federation != null}): " +
+                IceServerListBuilder.describe(specs)
+        )
+        iceServers = specs.map { spec ->
+            val builder = PeerConnection.IceServer.builder(spec.url)
+            if (spec.username != null) builder.setUsername(spec.username)
+            if (spec.credential != null) builder.setPassword(spec.credential)
+            builder.createIceServer()
+        }.toMutableList()
     }
 
     private fun checkCapabilities() {
@@ -2739,6 +2724,9 @@ class CallActivity : CallBaseActivity() {
             }
         }
 
+        if (iceServers.isNullOrEmpty()) {
+            Log.w(TAG, "Creating peer connection for $sessionId ($type) without any ICE servers")
+        }
         return PeerConnectionWrapper(
             tempPeerConnectionFactory,
             iceServers,
