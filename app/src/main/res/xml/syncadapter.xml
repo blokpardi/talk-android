@@ -7,5 +7,5 @@
 -->
 <sync-adapter
     xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accountType="com.nextcloud.talk2"
+    android:accountType="net.pardi.talk"
     android:contentAuthority="com.android.contacts" />

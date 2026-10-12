@@ -82,7 +82,7 @@ android {
     productFlavors {
         // used for f-droid
         create("generic") {
-            applicationId = "com.nextcloud.talk2"
+            applicationId = "net.pardi.talk"
             dimension = "default"
         }
         create("gplay") {

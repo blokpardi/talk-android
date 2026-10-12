@@ -6,7 +6,7 @@
   ~ SPDX-License-Identifier: GPL-3.0-or-later
 -->
 <account-authenticator xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accountType="com.nextcloud.talk2"
+    android:accountType="net.pardi.talk"
     android:icon="@mipmap/ic_launcher"
     android:smallIcon="@mipmap/ic_launcher"
     android:label="@string/nc_app_product_name"/>
