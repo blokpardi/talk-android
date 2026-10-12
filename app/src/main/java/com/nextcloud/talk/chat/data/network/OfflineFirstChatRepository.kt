@@ -33,6 +33,7 @@ import com.nextcloud.talk.models.json.participants.ParticipantDto
 import com.nextcloud.talk.utils.message.SendMessageUtils
 import com.nextcloud.talk.utils.revertOnCancellation
 import com.nextcloud.talk.utils.withRetry
+import com.nextcloud.talk.webrtc.FederationLinkState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
@@ -363,8 +364,14 @@ class OfflineFirstChatRepository @Inject constructor(
         Log.d(TAG, "---- initInsuranceRequests ------------")
 
         while (true) {
-            delay(INSURANCE_REQUEST_DELAY)
-            Log.d(TAG, "execute insurance request")
+            // While the link of this federated conversation to its host's signaling server is interrupted, chat
+            // relay delivers nothing: poll quickly instead, and wake up right away when the link state changes.
+            val interrupted = FederationLinkState.isInterrupted(roomToken)
+            val waitMillis = if (interrupted) FEDERATION_FALLBACK_POLL_DELAY else INSURANCE_REQUEST_DELAY
+            withTimeoutOrNull(waitMillis) {
+                FederationLinkState.interruptedRooms.first { rooms -> rooms.contains(roomToken) != interrupted }
+            }
+            Log.d(TAG, "execute insurance request (federation link interrupted=$interrupted)")
 
             fetchNewMessages()
         }
@@ -1295,6 +1302,7 @@ class OfflineFirstChatRepository @Inject constructor(
         private const val DEFAULT_MESSAGES_LIMIT = 100
         private const val MILLIES = 1000L
         private const val INSURANCE_REQUEST_DELAY = 2 * 60 * MILLIES
+        private const val FEDERATION_FALLBACK_POLL_DELAY = 5 * MILLIES
 
         private const val MINUS_ONE = -1L
 

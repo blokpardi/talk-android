@@ -12,6 +12,7 @@ import android.text.TextUtils
 import android.util.Log
 import autodagger.AutoInjector
 import com.bluelinelabs.logansquare.LoganSquare
+import com.nextcloud.talk.api.NcApi
 import com.nextcloud.talk.application.NextcloudTalkApplication
 import com.nextcloud.talk.application.NextcloudTalkApplication.Companion.sharedApplication
 import com.nextcloud.talk.data.user.model.User
@@ -31,6 +32,7 @@ import com.nextcloud.talk.models.json.websocket.HelloResponseOverallWebSocketMes
 import com.nextcloud.talk.models.json.websocket.JoinedRoomOverallWebSocketMessage
 import com.nextcloud.talk.signaling.SignalingMessageReceiver
 import com.nextcloud.talk.signaling.SignalingMessageSender
+import com.nextcloud.talk.utils.ApiUtils
 import com.nextcloud.talk.utils.bundle.BundleKeys
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -63,6 +65,10 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
     @JvmField
     @Inject
     var context: Context? = null
+
+    @JvmField
+    @Inject
+    var ncApi: NcApi? = null
     private val conversationUser: User
     private val webSocketTicket: String
     private var resumeId: String? = null
@@ -87,6 +93,12 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
 
     @Volatile
     private var isShutDown = false
+
+    // Federated link recovery (see FederationLinkState)
+    private var federatedRejoinAttempts = 0
+    private var federatedRejoinPending = false
+    private var federatedRejoinGeneration = 0
+    private var federatedRejoinFuture: ScheduledFuture<*>? = null
     private val usersHashMap: HashMap<String?, ParticipantDto>
     private var messagesQueue: MutableList<String> = ArrayList()
     private val signalingMessageReceiver = ExternalSignalingMessageReceiver()
@@ -268,6 +280,13 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
                             processRoomJoinMessage(eventOverallWebSocketMessage)
                         } else if ("leave" == eventOverallWebSocketMessage.eventMap!!["type"]) {
                             processRoomLeaveMessage(eventOverallWebSocketMessage)
+                        } else if ("federation_interrupted" == eventOverallWebSocketMessage.eventMap!!["type"]) {
+                            Log.i(TAG, "Link to the signaling server of the conversation host interrupted")
+                            setFederationLinkInterrupted(true)
+                        } else if ("federation_resumed" == eventOverallWebSocketMessage.eventMap!!["type"]) {
+                            Log.i(TAG, "Link to the signaling server of the conversation host restored")
+                            resetFederatedRejoin()
+                            setFederationLinkInterrupted(false)
                         }
                         signalingMessageReceiver.processChatMessage(eventOverallWebSocketMessage.eventMap)
                     }
@@ -354,6 +373,13 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
         if (roomWebSocketMessage != null) {
             val alreadyInRoom = roomWebSocketMessage.roomId == currentRoomToken
             currentRoomToken = roomWebSocketMessage.roomId
+            if (!currentRoomToken.isNullOrEmpty() && currentRoomToken == requestedRoomToken &&
+                (federatedRejoinPending || federatedRejoinAttempts > 0)
+            ) {
+                Log.d(TAG, "Federated conversation joined again, link recovered")
+                resetFederatedRejoin()
+                setFederationLinkInterrupted(false)
+            }
             if (roomWebSocketMessage.roomPropertiesWebSocketMessage != null && !TextUtils.isEmpty(currentRoomToken)) {
                 if (alreadyInRoom) {
                     sendRoomUpdatedEvent()
@@ -368,6 +394,13 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
     private fun processErrorMessage(webSocket: WebSocket, text: String) {
         Log.e(TAG, "Received error: $text")
         val (_, message) = LoganSquare.parse(text, ErrorOverallWebSocketMessage::class.java)
+        if (message != null && isFederatedRoomRequested() && isFederatedLinkError(message.code)) {
+            // The signaling server gave up the link of the federated conversation to its host (or rejected the
+            // federated join, e.g. "token_expired" after the host restarted): poll and re-join with fresh settings.
+            Log.w(TAG, "Federated link failed (${message.code}), scheduling re-join")
+            scheduleFederatedRejoin()
+            return
+        }
         if (message != null) {
             if ("no_such_session" == message.code) {
                 Log.d(TAG, "WebSocket " + webSocket.hashCode() + " resumeID " + resumeId + " expired")
@@ -478,7 +511,103 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
     }
 
     fun hasMCU(): Boolean = hasMCU
-    fun supportsChatRelay(): Boolean = supportsChatRelay
+    /** Chat relay is withheld while the federated link of the requested room is interrupted, so the chat polls. */
+    fun supportsChatRelay(): Boolean = supportsChatRelay && !FederationLinkState.isInterrupted(requestedRoomToken)
+
+    private fun isFederatedRoomRequested(): Boolean =
+        !requestedRoomToken.isNullOrEmpty() && !currentFederation?.server.isNullOrEmpty()
+
+    private fun isFederatedLinkError(code: String?): Boolean =
+        code == "token_expired" ||
+            (FederationLinkState.isInterrupted(requestedRoomToken) && code !in NON_FEDERATION_ERRORS)
+
+    private fun setFederationLinkInterrupted(interrupted: Boolean) {
+        val token = requestedRoomToken ?: currentRoomToken
+        if (FederationLinkState.setInterrupted(token, interrupted)) {
+            val map = HashMap<String, String?>()
+            map[Globals.ROOM_TOKEN] = token
+            map["interrupted"] = interrupted.toString()
+            eventBus?.post(WebSocketCommunicationEvent("federationLinkChanged", map))
+        }
+    }
+
+    @Synchronized
+    private fun scheduleFederatedRejoin() {
+        val token = requestedRoomToken
+        if (isShutDown || token.isNullOrEmpty() || currentFederation?.server.isNullOrEmpty() ||
+            federatedRejoinPending
+        ) {
+            return
+        }
+        federatedRejoinPending = true
+        setFederationLinkInterrupted(true)
+        val generation = ++federatedRejoinGeneration
+        val delay = FederationLinkState.rejoinDelayMillis(federatedRejoinAttempts)
+        federatedRejoinAttempts++
+        Log.d(TAG, "Federated re-join attempt $federatedRejoinAttempts in $delay ms")
+        federatedRejoinFuture = reconnectExecutor.schedule(
+            { rejoinFederatedRoom(token, generation) },
+            delay,
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    @Synchronized
+    private fun resetFederatedRejoin() {
+        federatedRejoinFuture?.cancel(false)
+        federatedRejoinFuture = null
+        federatedRejoinPending = false
+        federatedRejoinAttempts = 0
+        federatedRejoinGeneration++
+    }
+
+    /** Runs on the reconnect thread: fetches fresh signaling settings, then leaves and joins the room again. */
+    private fun rejoinFederatedRoom(token: String, generation: Int) {
+        fun isOutdated() = generation != federatedRejoinGeneration || token != requestedRoomToken || isShutDown
+        if (isOutdated()) return
+
+        val federation = try {
+            val apiVersion = ApiUtils.getSignalingApiVersion(conversationUser, intArrayOf(ApiUtils.API_V3, 2, 1))
+            ncApi!!.getSignalingSettings(
+                ApiUtils.getCredentials(conversationUser.username, conversationUser.token),
+                ApiUtils.getUrlForSignalingSettings(apiVersion, conversationUser.baseUrl, token)
+            ).blockingFirst().ocs?.settings?.federation ?: FederationSettingsDto()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to get signaling settings of the federated conversation", e)
+            null
+        }
+
+        synchronized(this) {
+            if (isOutdated()) return
+            federatedRejoinPending = false
+            when (FederationLinkState.decideRejoin(federation != null, federation?.server)) {
+                FederationLinkState.RejoinDecision.RETRY -> scheduleFederatedRejoin()
+                FederationLinkState.RejoinDecision.STOP ->
+                    Log.i(TAG, "Federated conversation has no host signaling server any more, keep polling")
+                FederationLinkState.RejoinDecision.REJOIN -> {
+                    if (!isConnected) {
+                        // A new session re-joins by itself (processHelloMessage); a resumed one by the next attempt
+                        scheduleFederatedRejoin()
+                        return
+                    }
+                    val session = currentNormalBackendSession
+                    Log.i(TAG, "Joining the federated conversation $token again")
+                    try {
+                        sendMessage(
+                            LoganSquare.serialize(
+                                webSocketConnectionHelper.getAssembledJoinOrLeaveRoomModel("", session, null)
+                            )
+                        )
+                    } catch (e: IOException) {
+                        Log.e(TAG, "Failed to serialize leave message", e)
+                    }
+                    currentRoomToken = ""
+                    currentFederation = federation
+                    joinRoomWithRoomTokenAndSession(token, session, federation)
+                }
+            }
+        }
+    }
 
     @Suppress("Detekt.ComplexMethod")
     fun joinRoomWithRoomTokenAndSession(
@@ -493,6 +622,10 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
             val message = LoganSquare.serialize(
                 webSocketConnectionHelper.getAssembledJoinOrLeaveRoomModel(roomToken, normalBackendSession, federation)
             )
+            if (roomToken != requestedRoomToken) {
+                resetFederatedRejoin()
+                FederationLinkState.setInterrupted(requestedRoomToken, false)
+            }
             requestedRoomToken = roomToken.ifEmpty { null }
             if (roomToken == "") {
                 Log.d(TAG, "sending 'leave room' via websocket")
@@ -619,6 +752,7 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
         private const val INITIAL_RECONNECT_DELAY_MS: Long = 1000
         private const val MAX_RECONNECT_DELAY_MS: Long = 30000
         private const val MAX_BACKOFF_SHIFT = 5
+        private val NON_FEDERATION_ERRORS = setOf("no_such_session", "hello_expected", "processing_failed")
         private const val JITTER_FRACTION = 0.2
 
         private val reconnectExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
