@@ -17,8 +17,11 @@ import android.util.Log;
 import android.util.Rational;
 import android.view.View;
 import android.view.Window;
-import android.view.WindowInsets;
 import android.view.WindowManager;
+
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
 
 import com.nextcloud.talk.BuildConfig;
 
@@ -50,11 +53,7 @@ public abstract class CallBaseActivity extends BaseActivity {
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         dismissKeyguard();
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            getWindow().getInsetsController().hide(WindowInsets.Type.statusBars());
-        } else {
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
-        }
+        hideStatusBar();
 
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
@@ -69,6 +68,23 @@ public abstract class CallBaseActivity extends BaseActivity {
         }
 
         getOnBackPressedDispatcher().addCallback(this, onBackPressedCallback);
+    }
+
+    /**
+     * Hides the status bar for the call screen. Window#getInsetsController() is nullable (e.g. before the decor view
+     * exists), so use the WindowCompat controller, which installs the decor view first, and fall back to the legacy
+     * fullscreen flag if that ever fails.
+     */
+    private void hideStatusBar() {
+        try {
+            WindowInsetsControllerCompat controller =
+                WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+            controller.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            controller.hide(WindowInsetsCompat.Type.statusBars());
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Could not hide status bar via insets controller, using FLAG_FULLSCREEN", e);
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        }
     }
 
     public void hideNavigationIfNoPipAvailable() {
