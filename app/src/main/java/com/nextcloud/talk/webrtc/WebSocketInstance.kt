@@ -255,11 +255,16 @@ class WebSocketInstance internal constructor(conversationUser: User, connectionU
         if (callWebSocketMessage != null) {
             val ncSignalingMessage = callWebSocketMessage.ncSignalingMessage
 
-            if (ncSignalingMessage != null &&
-                TextUtils.isEmpty(ncSignalingMessage.from) &&
-                callWebSocketMessage.senderWebSocketMessage != null
-            ) {
-                ncSignalingMessage.from = callWebSocketMessage.senderWebSocketMessage!!.sessionId
+            if (ncSignalingMessage != null && callWebSocketMessage.senderWebSocketMessage != null) {
+                val resolvedFrom = FederatedSenderNormalizer.resolveFrom(
+                    ncSignalingMessage.from,
+                    callWebSocketMessage.senderWebSocketMessage!!.sessionId,
+                    sessionId
+                )
+                if (resolvedFrom != ncSignalingMessage.from && !TextUtils.isEmpty(ncSignalingMessage.from)) {
+                    Log.d(TAG, "Routing ${ncSignalingMessage.type} from own federated session to own publisher")
+                }
+                ncSignalingMessage.from = resolvedFrom
             }
 
             signalingMessageReceiver.processChatMessage(callWebSocketMessage)
