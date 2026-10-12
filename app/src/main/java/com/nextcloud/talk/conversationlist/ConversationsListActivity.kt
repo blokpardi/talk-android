@@ -1218,6 +1218,17 @@ class ConversationsListActivity : BaseActivity() {
             return
         }
 
+        // Re-tapping the conversation that is already open in the split pane: keep the existing chat (and its
+        // room session) instead of relaunching it, which would leave and re-join the same room.
+        if (textToPaste.isNullOrEmpty() &&
+            filesToShare.isNullOrEmpty() &&
+            selectedMessageId == null &&
+            ChatActivity.isOpenInSplitPane(selectedConversation!!.token, currentUser.id)
+        ) {
+            clearIntentAction()
+            return
+        }
+
         val bundle = Bundle()
         bundle.putString(KEY_SHARED_TEXT, textToPaste)
         if (!filesToShare.isNullOrEmpty()) {

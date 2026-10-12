@@ -532,12 +532,15 @@ class ChatActivity :
                 logConversationInfos("leaveRoom#onNext")
 
                 isLeavingRoom = false
+                if (leavingRoomToken == roomToken) {
+                    leavingRoomToken = null
+                }
 
                 if (getRoomInfoTimerHandler != null) {
                     getRoomInfoTimerHandler?.removeCallbacksAndMessages(null)
                 }
 
-                if (!isAnotherRoomCurrent()) {
+                if (!isAnotherRoomCurrent() && !isRoomSessionReusedByAnotherChat()) {
                     ApplicationWideCurrentRoomHolder.getInstance().clear()
                 }
             }
@@ -2094,6 +2097,10 @@ class ChatActivity :
 
         logConversationInfos("onResume")
 
+        if (isEmbeddedNextToConversationList()) {
+            embeddedInstance = java.lang.ref.WeakReference(this)
+        }
+
         pullChatMessagesPending = false
 
         // reset in case a previously started leave failed (success already resets this in leaveRoomObserver)
@@ -3010,6 +3017,10 @@ class ChatActivity :
         super.onDestroy()
         logConversationInfos("onDestroy")
 
+        if (embeddedInstance?.get() === this) {
+            embeddedInstance = null
+        }
+
         if (::initialUser.isInitialized) {
             chatViewModel.leaveRoomViewState.removeObserver(leaveRoomObserver)
         }
@@ -3025,7 +3036,8 @@ class ChatActivity :
 
     private fun joinRoomWithPassword() {
         // if ApplicationWideCurrentRoomHolder contains a session (because a call is active), then keep the sessionId
-        if (ApplicationWideCurrentRoomHolder.getInstance().isCurrentRoom(
+        if (leavingRoomToken != currentConversation!!.token &&
+            ApplicationWideCurrentRoomHolder.getInstance().isCurrentRoom(
                 currentConversation!!.token,
                 conversationUser.id
             )
@@ -3059,6 +3071,8 @@ class ChatActivity :
         if (webSocketInstance != null && currentConversation != null && !isAnotherRoomCurrent()) {
             webSocketInstance?.joinRoomWithRoomTokenAndSession("", sessionIdAfterRoomJoined)
         }
+        leftSessionId = sessionIdAfterRoomJoined
+        leavingRoomToken = roomToken
         sessionIdAfterRoomJoined = "0"
 
         // FIXME Fix API checking with guests?
@@ -3081,6 +3095,15 @@ class ChatActivity :
      * True when another chat has already joined a room, e.g. when a new chat replaced this one in the split pane
      * next to the conversation list. Leaving must then not reset the shared room and signaling state.
      */
+    /**
+     * True when a newer ChatActivity for the same room (e.g. relaunched in the split pane) has already joined with a
+     * different session than the one this instance left; the shared holder then belongs to that chat.
+     */
+    private fun isRoomSessionReusedByAnotherChat(): Boolean {
+        val holderSession = ApplicationWideCurrentRoomHolder.getInstance().session
+        return !holderSession.isNullOrEmpty() && holderSession != "0" && holderSession != leftSessionId
+    }
+
     private fun isAnotherRoomCurrent(): Boolean {
         val currentRoomToken = ApplicationWideCurrentRoomHolder.getInstance().currentRoomToken
         return !currentRoomToken.isNullOrEmpty() && currentRoomToken != roomToken
@@ -4138,6 +4161,8 @@ class ChatActivity :
 
     private fun isChatThread(): Boolean = conversationThreadId != null && conversationThreadId!! > 0
 
+    private var leftSessionId: String? = null
+
     private fun isEmbeddedNextToConversationList(): Boolean =
         ActivityEmbeddingController.getInstance(this).isActivityEmbedded(this)
 
@@ -4249,6 +4274,25 @@ class ChatActivity :
 
     companion object {
         val TAG = ChatActivity::class.java.simpleName
+
+        /** Chat currently shown in the split pane next to the conversation list (null when not embedded). */
+        private var embeddedInstance: java.lang.ref.WeakReference<ChatActivity>? = null
+
+        /** Room token for which a leave request is still in flight; its holder session must not be reused. */
+        @Volatile
+        private var leavingRoomToken: String? = null
+
+        /**
+         * True when [roomToken] of user [userId] is already open in the split pane next to the conversation list,
+         * so re-tapping it must not start a new ChatActivity (which would leave and re-join the same room).
+         */
+        fun isOpenInSplitPane(roomToken: String?, userId: Long?): Boolean {
+            val chat = embeddedInstance?.get() ?: return false
+            return !chat.isFinishing && !chat.isDestroyed &&
+                chat.isEmbeddedNextToConversationList() &&
+                chat.roomToken == roomToken &&
+                chat.conversationUserId == userId
+        }
 
         /**
          * Creates an intent that opens the conversation [roomToken] of the account with the internal id [userId].
